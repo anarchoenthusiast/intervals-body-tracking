@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Poster Prototype</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: sans-serif; }
+        canvas { display: block; }
+        
+        #controls {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 300px;
+            padding: 20px;
+            background: rgba(30, 30, 30, 0.9);
+            color: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            z-index: 100;
+        }
+        
+        h3 { margin-top: 0; margin-bottom: 15px; font-size: 16px; text-transform: uppercase; letter-spacing: 1px; }
+        
+        .control-group { margin-bottom: 15px; }
+        
+        label { display: block; margin-bottom: 5px; font-size: 12px; opacity: 0.7; }
+        
+        textarea {
+            width: 100%;
+            height: 100px;
+            background: #111;
+            border: 1px solid #444;
+            color: white;
+            padding: 8px;
+            font-family: inherit;
+            resize: vertical;
+            font-size: 14px;
+        }
+        
+        input[type="file"] {
+            width: 100%;
+            font-size: 12px;
+        }
+        
+        button {
+            background: white;
+            color: black;
+            border: none;
+            padding: 8px 16px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-top: 5px;
+            width: 100%;
+        }
+        button:hover { background: #eee; }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <h3>Poster Controls</h3>
+        
+        <div class="control-group">
+            <label>POSTER TEXT</label>
+            <textarea id="textInput" spellcheck="false">YALE SCHOOL
+OF ART
+PRISON ED
+INITIATIVE</textarea>
+            <button id="updateTextBtn">UPDATE TEXT</button>
+        </div>
+
+        <div class="control-group">
+            <label>CUSTOM SHAPE (PNG w/ Alpha)</label>
+            <input type="file" id="shapeInput" accept="image/png, image/jpeg">
+            <label style="margin-top: 5px; font-size: 10px; color: #888;">* Upload a white shape on transparent background for best results.</label>
+        </div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- CONFIG ---
+        const CONFIG = {
+            bgColor: 0x000000,
+            wingColor: '#ffffff',
+            textColor: '#000000',
+            flapSpeed: 2.0,
+            flapAmplitude: 0.8,
+            frustumSize: 45
+        };
+
+        // --- SCENE ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(CONFIG.bgColor);
+
+        const aspect = window.innerWidth / window.innerHeight;
+        const camera = new THREE.OrthographicCamera(
+            CONFIG.frustumSize * aspect / -2, 
+            CONFIG.frustumSize * aspect / 2, 
+            CONFIG.frustumSize / 2, 
+            CONFIG.frustumSize / -2, 
+            1, 
+            1000
+        );
+        camera.position.z = 50;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+
+        // --- TEXTURE GENERATOR ---
+        function createPosterTexture(text, textColor, bgColor) {
+            const width = 2048;
+            const height = 2048 / aspect; 
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+
+            // Fill background
+            ctx.fillStyle = bgColor;
+            ctx.fillRect(0, 0, width, height);
+
+            // Draw Typography
+            ctx.fillStyle = textColor;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            
+            const cx = width / 2;
+            const cy = height / 2;
+
+            ctx.save();
+            ctx.translate(cx, cy);
+
+            const lines = text.split('\n');
+            
+            // Auto-fit text size roughly
+            const fontSize = 300 * (4 / Math.max(lines.length, 3)); 
+            ctx.font = `bold ${fontSize}px Helvetica, Arial, sans-serif`;
+            const lineHeight = fontSize * 1.1;
+            
+            const totalHeight = lines.length * lineHeight;
+            const startY = -totalHeight / 2 + lineHeight / 2;
+
+            lines.forEach((line, i) => {
+                ctx.fillText(line.toUpperCase(), 0, startY + i * lineHeight);
+            });
+            
+            ctx.restore();
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            return texture;
+        }
+
+        // --- SHAPE GENERATOR (DEFAULT) ---
+        function createDefaultWingAlphaMap() {
+            const size = 512;
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, size, size);
+
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath();
+            // Wing shape starting from left edge (x=0)
+            ctx.moveTo(0, size * 0.4);
+            ctx.bezierCurveTo(size * 0.5, 0, size, 0, size, size * 0.3);
+            ctx.bezierCurveTo(size, size * 0.6, size * 0.5, size, 0, size * 0.8);
+            ctx.lineTo(0, size * 0.4);
+            ctx.fill();
+
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        // --- STATE ---
+        let bgTexture, wingTexture, alphaMap;
+        let bgMaterial, butterflyMaterial;
+        let butterflies = [];
+
+        // Initialize Textures
+        const initialText = document.getElementById('textInput').value;
+        bgTexture = createPosterTexture(initialText, '#ffffff', '#000000');
+        wingTexture = createPosterTexture(initialText, '#000000', '#ffffff');
+        alphaMap = createDefaultWingAlphaMap();
+
+        // Materials
+        bgMaterial = new THREE.MeshBasicMaterial({ map: bgTexture });
+        
+        butterflyMaterial = new THREE.MeshBasicMaterial({
+            map: wingTexture,
+            alphaMap: alphaMap,
+            transparent: true,
+            side: THREE.DoubleSide,
+            alphaTest: 0.1
+        });
+
+        // Background Plane
+        const bgGeometry = new THREE.PlaneGeometry(CONFIG.frustumSize * aspect, CONFIG.frustumSize);
+        const bgPlane = new THREE.Mesh(bgGeometry, bgMaterial);
+        bgPlane.position.z = -1;
+        scene.add(bgPlane);
+
+        // --- BUTTERFLY CLASS ---
+        function remapUVsToGlobalSpace(geometry, butterflyX, butterflyY, isLeftWing) {
+            const uvs = geometry.attributes.uv;
+            const pos = geometry.attributes.position;
+            const count = uvs.count;
+            const worldHeight = CONFIG.frustumSize;
+            const worldWidth = worldHeight * aspect;
+            const minX = -worldWidth / 2;
+            const maxX = worldWidth / 2;
+            const minY = -worldHeight / 2;
+            const maxY = worldHeight / 2;
+
+            for (let i = 0; i < count; i++) {
+                let vx = pos.getX(i);
+                let vy = pos.getY(i);
+                if (isLeftWing) vx = -vx; 
+                const absX = butterflyX + vx;
+                const absY = butterflyY + vy;
+                const u = (absX - minX) / (maxX - minX);
+                const v = (absY - minY) / (maxY - minY);
+                uvs.setXY(i, u, v);
+            }
+            uvs.needsUpdate = true;
+        }
+
+        class Butterfly {
+            constructor(x, y, size) {
+                this.group = new THREE.Group();
+                this.group.position.set(x, y, 0);
+                this.phase = Math.random() * Math.PI * 2;
+                this.x = x; // Store for physics/layout if needed
+                this.y = y;
+                this.radius = size * 0.8;
+
+                // Right Wing
+                const geomRight = new THREE.PlaneGeometry(1, 1, 10, 10);
+                geomRight.translate(0.5, 0, 0);
+                geomRight.scale(size, size * 1.5, 1);
+                remapUVsToGlobalSpace(geomRight, x, y, false);
+                this.rightWing = new THREE.Mesh(geomRight, butterflyMaterial); // Use shared material
+
+                // Left Wing
+                const geomLeft = new THREE.PlaneGeometry(1, 1, 10, 10);
+                geomLeft.translate(0.5, 0, 0);
+                geomLeft.scale(size, size * 1.5, 1);
+                remapUVsToGlobalSpace(geomLeft, x, y, true);
+                this.leftWing = new THREE.Mesh(geomLeft, butterflyMaterial);
+                this.leftWing.scale.x = -1; 
+
+                this.group.add(this.rightWing);
+                this.group.add(this.leftWing);
+                scene.add(this.group);
+            }
+
+            update(time) {
+                const angle = Math.sin(time * CONFIG.flapSpeed + this.phase) * CONFIG.flapAmplitude;
+                this.rightWing.rotation.y = -angle;
+                this.leftWing.rotation.y = -angle; 
+            }
+        }
+
+        // --- POPULATE ---
+        function spawnButterflies() {
+            // Clear existing
+            butterflies.forEach(b => scene.remove(b.group));
+            butterflies = [];
+
+            const maxButterflies = 40;
+            let attempts = 0;
+            const padding = 1.0; 
+
+            while (butterflies.length < maxButterflies && attempts < 2000) {
+                 attempts++;
+                 const size = 3 + Math.random() * 3;
+                 const radius = size * 0.8; 
+                 const boundX = (CONFIG.frustumSize * aspect / 2) - radius;
+                 const boundY = (CONFIG.frustumSize / 2) - radius;
+                 
+                 const x = (Math.random() * 2 - 1) * boundX;
+                 const y = (Math.random() * 2 - 1) * boundY;
+
+                 let overlapping = false;
+                 for (let b of butterflies) {
+                     const dx = x - b.x;
+                     const dy = y - b.y;
+                     const dist = Math.sqrt(dx*dx + dy*dy);
+                     if (dist < (radius + b.radius + padding)) {
+                         overlapping = true;
+                         break;
+                     }
+                 }
+
+                 if (!overlapping) {
+                     butterflies.push(new Butterfly(x, y, size));
+                 }
+            }
+        }
+        
+        spawnButterflies();
+
+        // --- INTERACTION ---
+        
+        // 1. Text Update
+        document.getElementById('updateTextBtn').addEventListener('click', () => {
+            const text = document.getElementById('textInput').value;
+            
+            // Create new textures
+            const newBgTex = createPosterTexture(text, '#ffffff', '#000000');
+            const newWingTex = createPosterTexture(text, '#000000', '#ffffff');
+            
+            // Update Background
+            bgMaterial.map = newBgTex;
+            bgMaterial.needsUpdate = true;
+            
+            // Update Butterfly Material
+            butterflyMaterial.map = newWingTex;
+            butterflyMaterial.needsUpdate = true;
+        });
+
+        // 2. Shape Upload
+        document.getElementById('shapeInput').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(event) {
+                const img = new Image();
+                img.onload = function() {
+                    const texture = new THREE.Texture(img);
+                    texture.needsUpdate = true;
+                    
+                    // Update material alpha map
+                    butterflyMaterial.alphaMap = texture;
+                    butterflyMaterial.needsUpdate = true;
+                };
+                img.src = event.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
+
+        // --- LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = performance.now() * 0.001;
+            butterflies.forEach(b => b.update(time));
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+             // Basic resize logic (reloading page is better for full poster resize to keep aspect ratio)
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>

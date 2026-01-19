@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mist Text Experiment v3</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/p5.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.9/dat.gui.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #fff; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <script>
+        let settings = {
+            text: "S 5 R",
+            fontSize: 250,
+            
+            // Анимация
+            speed: 0.5,         // Скорость общего времени
+            swaySpeed: 0.002,   // Скорость покачивания символов
+            swayAmp: 50,        // Амплитуда покачивания
+            tailSpeed: 0.02,    // Скорость колыхания хвоста
+            
+            // Настройки "эха" (хвоста)
+            layers: 15,         // Сколько копий в глубину
+            scaleStep: 0.92,    // Уменьшение масштаба
+            
+            // Вектор глубины (базовое направление хвоста)
+            baseOffsetX: 10,
+            baseOffsetY: 10,
+            tailSway: 15,       // Насколько сильно хвост "гуляет" сам по себе
+
+            // Визуал
+            blurStart: 0,
+            blurStep: 4,
+            opacityStart: 255,
+            opacityDecay: 0.85,
+            
+            bgNoise: 30
+        };
+
+        let glyphs = [];
+        let myFont;
+
+        function setup() {
+            createCanvas(windowWidth, windowHeight);
+            textFont('Arial Black');
+            textAlign(CENTER, CENTER);
+            
+            let gui = new dat.GUI();
+            
+            // Текст
+            gui.add(settings, 'text').name('Текст').onFinishChange(initGlyphs);
+            
+            let fAnim = gui.addFolder('Движение (Motion)');
+            fAnim.add(settings, 'speed', 0, 2).name('Time Scale');
+            fAnim.add(settings, 'swaySpeed', 0, 0.01).name('Sway Speed');
+            fAnim.add(settings, 'swayAmp', 0, 200).name('Sway Amp');
+            fAnim.add(settings, 'tailSpeed', 0, 0.1).name('Tail Freq');
+            fAnim.add(settings, 'tailSway', 0, 50).name('Tail Amp');
+            fAnim.open();
+
+            let fLayers = gui.addFolder('Глубина (Depth)');
+            fLayers.add(settings, 'layers', 1, 30).step(1);
+            fLayers.add(settings, 'scaleStep', 0.8, 0.99);
+            fLayers.add(settings, 'baseOffsetX', -50, 50).name('Dir X');
+            fLayers.add(settings, 'baseOffsetY', -50, 50).name('Dir Y');
+            fLayers.open();
+
+            let fStyle = gui.addFolder('Стиль');
+            fStyle.add(settings, 'fontSize', 50, 400);
+            fStyle.add(settings, 'blurStep', 0, 10);
+            fStyle.add(settings, 'opacityDecay', 0.5, 0.99);
+            fStyle.add(settings, 'bgNoise', 0, 100);
+            
+            initGlyphs();
+        }
+
+        function initGlyphs() {
+            glyphs = [];
+            let chars = settings.text.split('');
+            // Простая раскладка в линию или сетку
+            // Для начала просто раскидаем их случайно в центре, чтобы было интереснее
+            // Или в линию, но с рандомным смещением
+            
+            let startX = -((chars.length - 1) * 150) / 2;
+            
+            chars.forEach((char, i) => {
+                if (char === ' ') return;
+                glyphs.push({
+                    char: char,
+                    // Базовая позиция (якорь)
+                    anchorX: startX + i * 200, 
+                    anchorY: random(-100, 100),
+                    // Оффсет для шума, чтобы двигались не синхронно
+                    noiseOffset: random(1000)
+                });
+            });
+        }
+
+        function draw() {
+            background(255);
+            
+            // Шум фона
+            if (settings.bgNoise > 0) {
+                loadPixels();
+                for (let i = 0; i < pixels.length; i += 4) {
+                    let n = random(-settings.bgNoise, settings.bgNoise);
+                    pixels[i] += n;
+                    pixels[i+1] += n;
+                    pixels[i+2] += n;
+                }
+                updatePixels();
+            }
+
+            translate(width/2, height/2);
+
+            let t = millis() * settings.speed;
+
+            glyphs.forEach(g => {
+                // Вычисляем текущую плавающую позицию головы
+                // Используем noise для плавного органического дрейфа
+                let floatX = (noise(t * settings.swaySpeed, g.noiseOffset) - 0.5) * settings.swayAmp * 2;
+                let floatY = (noise(t * settings.swaySpeed + 5000, g.noiseOffset) - 0.5) * settings.swayAmp * 2;
+                
+                let x = g.anchorX + floatX;
+                let y = g.anchorY + floatY;
+
+                drawGlyphStack(g.char, x, y, t, g.noiseOffset);
+            });
+        }
+
+        function drawGlyphStack(char, x, y, time, seed) {
+            // Рисуем от дальнего к ближнему
+            for (let i = settings.layers; i >= 0; i--) {
+                push();
+                
+                // Анимируем направление хвоста
+                // Хвост извивается по синусоиде/шуму в зависимости от глубины (i)
+                let waveX = sin(time * settings.tailSpeed + i * 0.2 + seed) * settings.tailSway;
+                let waveY = cos(time * settings.tailSpeed + i * 0.2 + seed) * settings.tailSway;
+
+                // Смещение слоя складывается из:
+                // 1. Базового направления (baseOffset)
+                // 2. Волнового изгиба (wave)
+                let layerOffsetX = (settings.baseOffsetX + waveX) * i;
+                let layerOffsetY = (settings.baseOffsetY + waveY) * i;
+
+                let layerX = x + layerOffsetX;
+                let layerY = y + layerOffsetY;
+                
+                // Масштаб
+                let scaleVal = Math.pow(settings.scaleStep, i);
+                
+                // Прозрачность
+                let alpha = i === 0 ? 255 : settings.opacityStart * Math.pow(settings.opacityDecay, i);
+                
+                // Размытие увеличивается с глубиной
+                let blurVal = settings.blurStart + (settings.blurStep * i);
+
+                translate(layerX, layerY);
+                scale(scaleVal);
+                
+                // Оптимизация: не ставить фильтр, если 0
+                if (blurVal > 0.5) {
+                    drawingContext.filter = `blur(${blurVal}px)`;
+                } else {
+                    drawingContext.filter = 'none';
+                }
+
+                fill(0, alpha);
+                noStroke();
+                textSize(settings.fontSize);
+                text(char, 0, 0);
+
+                pop();
+            }
+            drawingContext.filter = 'none';
+        }
+
+        function windowResized() {
+            resizeCanvas(windowWidth, windowHeight);
+        }
+    </script>
+</body>
+</html>

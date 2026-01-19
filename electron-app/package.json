@@ -1,0 +1,15 @@
+{
+  "name": "polar-kinetic-app",
+  "version": "1.0.0",
+  "description": "Polar Kinetic Typography Tool",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^28.2.0"
+  }
+}

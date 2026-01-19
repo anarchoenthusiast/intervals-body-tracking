@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polar Kinetic App (Multi-Layer)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/p5.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.9/dat.gui.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #222; }
+        canvas { display: block; }
+        /* Шахматка для прозрачности */
+        body::before {
+            content: ''; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background-image: linear-gradient(45deg, #333 25%, transparent 25%), linear-gradient(-45deg, #333 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #333 75%), linear-gradient(-45deg, transparent 75%, #333 75%);
+            background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+            pointer-events: none; z-index: -1; opacity: 0.3;
+        }
+    </style>
+</head>
+<body>
+    <div id="render-progress" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:300px; background:#000; border:2px solid #00ffff; padding:20px; z-index:1000; color:#00ffff; font-family:monospace; text-align:center;">
+        <div id="progress-text">RENDERING: 0%</div>
+        <div id="progress-bar" style="width:0%; height:10px; background:#00ffff; margin-top:10px;"></div>
+        <div id="progress-details" style="font-size:10px; margin-top:5px;">Frame 0 / 0</div>
+    </div>
+    <script>
+        // === ЗАГРУЗКА БИБЛИОТЕК (Node.js style) ===
+        try {
+            const fs = require('fs');
+            const path = require('path');
+            const libPath = path.join(__dirname, 'CCapture.all.min.js');
+            
+            if (fs.existsSync(libPath)) {
+                const libCode = fs.readFileSync(libPath, 'utf8');
+                const originalModule = typeof module !== 'undefined' ? module : undefined;
+                const originalExports = typeof exports !== 'undefined' ? exports : undefined;
+                window.module = undefined;
+                window.exports = undefined;
+                window.eval(libCode);
+                if (originalModule) window.module = originalModule;
+                if (originalExports) window.exports = originalExports;
+                console.log("CCapture.js loaded.");
+            } else {
+                console.warn("CCapture lib not found at " + libPath);
+            }
+        } catch (e) {
+            console.error("Lib load error:", e);
+        }
+
+        // Глобальная конфигурация
+        let sceneSettings = {
+            aspectRatio: '1:1',
+            resolution: 1080,
+            transparentBg: false,
+            activeLayerIndex: 0,
+            recordDuration: 5,
+            fps: 30,
+            exportFormat: 'webm-mediarecorder', 
+            exportQuality: 'High (PixelDensity 2)'
+        };
+
+        // Класс слоя
+        class PatternLayer {
+            constructor(name) {
+                this.name = name || 'Layer ' + (layers.length + 1);
+                this.visible = true;
+                this.type = 'flower'; // flower, sphere, clelia, custom_path
+                
+                // Трансформация
+                this.x = 0; 
+                this.y = 0;
+                this.scale = 1.0;
+                this.rotation = 0;
+                
+                // Параметры генерации
+                this.text = "LAYER " + (layers.length + 1);
+                this.color = '#ffffff';
+                
+                // Универсальные параметры
+                this.petals = 6;       // Для цветка (freq) / Для Clelia (m)
+                this.rings = 10;       // Кол-во витков / линий
+                this.spacing = 30;     // Радиус
+                this.amplitude = 20;   // Амплитуда искажения
+                this.twist = 0.2;      // Закручивание
+                this.speed = 0.02;     // Скорость
+                this.textSize = 14;
+                this.density = 1.0;
+                
+                // 3D
+                this.depth = 1.0;
+
+                // Шрифты
+                this.fontName = 'Courier New'; 
+                this.fontStyle = 'normal';     
+                this.customFont = null;        
+                this.useCustomFont = false;    
+                
+                // Изображения
+                this.customImage = null;
+                this.useImage = false;
+                this.imageScale = 1.0;
+
+                // Параметры для Custom Path (SVG)
+                this.customPathData = null; 
+                this.pathElement = null;    
+                this.pathLength = 0;
+                this.pathScale = 1.0;
+                this.pathReverse = false;
+                this.pathCenter = true;     
+                this.pathCenterX = 0; 
+                this.pathCenterY = 0;
+            }
+        }
+
+        let layers = [];
+        let canvasWidth = 1080;
+        let canvasHeight = 1080;
+        
+        let viewX = 0, viewY = 0, viewScale = 1;
+        let isDraggingView = false;
+        let isDraggingLayer = false;
+        let lastMouseX = 0, lastMouseY = 0;
+
+        let gui;
+        let layerFolder;
+
+        let capturer;
+        let recordingState = 'idle'; // idle, preparing, capturing
+        let prepareTimer = 0;
+        let recordedFrames = 0;
+        let targetFrames = 0;
+        let recWidth = 1080; 
+        let recHeight = 1080;
+
+        function setup() {
+            createCanvas(windowWidth, windowHeight);
+            textAlign(CENTER, CENTER);
+            textFont('Courier New');
+            pixelDensity(1);
+            frameRate(30);
+            
+            layers.push(new PatternLayer("Base Layer"));
+            
+            updateCanvasSize();
+            viewX = width / 2;
+            viewY = height / 2;
+            
+            initGUI();
+        }
+
+        function initGUI() {
+            if (gui) gui.destroy();
+            gui = new dat.GUI();
+            gui.width = 300;
+            
+            let fScene = gui.addFolder('Сцена / Экспорт');
+            fScene.add(sceneSettings, 'aspectRatio', ['1:1', '9:16', '16:9', '4:5']).name('Формат').onChange(updateCanvasSize);
+            fScene.add(sceneSettings, 'resolution', [720, 1080, 1920]).name('Разрешение').onChange(updateCanvasSize);
+            fScene.add(sceneSettings, 'transparentBg').name('Прозрачный фон');
+            
+            let fRec = fScene.addFolder('Настройки записи');
+            fRec.add(sceneSettings, 'recordDuration', 1, 60).step(1).name('Длительность (сек)');
+            
+            fRec.add({ fps: 30 }, 'fps', [30, 60]).name('FPS Видео').onChange(v => {
+                sceneSettings.fps = parseInt(v);
+                frameRate(sceneSettings.fps);
+            });
+            fRec.add(sceneSettings, 'exportFormat', ['webm-mediarecorder', 'png', 'jpg']).name('Формат');
+            fRec.add(sceneSettings, 'exportQuality', ['Normal (1x)', 'High (2x)']).name('Качество').onChange(v => {
+                if (v.includes('2x')) pixelDensity(2);
+                else pixelDensity(1);
+            });
+            fRec.open();
+
+            let recControl = { toggleRecord: toggleRecording };
+            fScene.add(recControl, 'toggleRecord').name('🔴 Начать Запись (Render)');
+            
+            fScene.add({ add: addNewLayer }, 'add').name('➕ Добавить слой');
+            fScene.open();
+
+            // Создаем ПОСТОЯННУЮ папку для слоя
+            layerFolder = gui.addFolder('Настройки Слоя');
+            layerFolder.open();
+            
+            updateLayerGUI();
+        }
+
+        function clearGuiFolder(folder) {
+            if (folder.__controllers) {
+                let controllers = [...folder.__controllers];
+                controllers.forEach(c => folder.remove(c));
+            }
+            if (folder.__folders) {
+                let subfolders = Object.keys(folder.__folders);
+                subfolders.forEach(name => {
+                    let sub = folder.__folders[name];
+                    clearGuiFolder(sub);
+                    if (sub.domElement.parentNode) {
+                        sub.domElement.parentNode.removeChild(sub.domElement);
+                    }
+                    delete folder.__folders[name];
+                });
+            }
+        }
+
+        function updateLayerGUI() {
+            let l = layers[sceneSettings.activeLayerIndex];
+            
+            // 1. Очищаем папку
+            clearGuiFolder(layerFolder);
+            
+            // 2. Заполняем заново
+            layerFolder.add(sceneSettings, 'activeLayerIndex', 0, layers.length - 1).step(1).name('ВЫБРАТЬ СЛОЙ (ID)').onChange(updateLayerGUI);
+            
+            layerFolder.add(l, 'visible').name('Видимость');
+            layerFolder.add(l, 'text').name('Текст');
+            layerFolder.addColor(l, 'color').name('Цвет');
+            
+            layerFolder.add(l, 'type', ['flower', 'sphere', 'clelia', 'custom_path'])
+                .name('Тип Узора')
+                .onChange(val => {
+                    l.type = val;
+                    setTimeout(updateLayerGUI, 10); 
+                });
+            
+            let fFont = layerFolder.addFolder('Шрифт / Иконка');
+            fFont.add(l, 'fontName').name('Системный Шрифт').onChange(() => l.useCustomFont = false);
+            fFont.add(l, 'fontStyle', ['normal', 'bold', 'italic']).name('Стиль');
+            
+            let fontLoader = {
+                load: () => {
+                    let input = document.createElement('input');
+                    input.type = 'file';
+                    input.accept = '.ttf,.otf,.woff';
+                    input.onchange = e => {
+                        let file = e.target.files[0];
+                        if (!file) return;
+                        let url = URL.createObjectURL(file);
+                        loadFont(url, font => {
+                            l.customFont = font;
+                            l.useCustomFont = true;
+                            l.fontName = file.name;
+                        }, err => alert("Ошибка: " + err));
+                    };
+                    input.click();
+                }
+            };
+            fFont.add(fontLoader, 'load').name('📂 Загрузить .TTF');
+
+            fFont.add(l, 'useImage').name('Использовать Иконку');
+            let imgLoader = {
+                load: () => {
+                    let input = document.createElement('input');
+                    input.type = 'file';
+                    input.accept = '.svg,.png,.jpg';
+                    input.onchange = e => {
+                        let file = e.target.files[0];
+                        if (!file) return;
+                        let url = URL.createObjectURL(file);
+                        loadImage(url, img => {
+                            l.customImage = img;
+                            l.useImage = true;
+                        });
+                    };
+                    input.click();
+                }
+            };
+            fFont.add(imgLoader, 'load').name('🖼 Загрузить SVG/PNG');
+            fFont.add(l, 'imageScale', 0.1, 5).name('Размер Иконки');
+
+            let fTrans = layerFolder.addFolder('Трансформация');
+            fTrans.add(l, 'x').step(1).listen(); 
+            fTrans.add(l, 'y').step(1).listen();
+            fTrans.add(l, 'scale', 0.1, 5).step(0.01).name('Масштаб');
+            fTrans.add(l, 'rotation', 0, TWO_PI).step(0.01).name('Поворот');
+            fTrans.open();
+            
+            let fGen = layerFolder.addFolder('Генерация');
+            fGen.open();
+            
+            if (l.type === 'flower') {
+                fGen.add(l, 'petals', 0, 20).step(1).name('Лепестки');
+                fGen.add(l, 'rings', 1, 50).step(1).name('Кольца');
+                fGen.add(l, 'spacing', 10, 200).name('Отступ');
+                fGen.add(l, 'amplitude', 0, 200).name('Искажение');
+                fGen.add(l, 'twist', -2, 2).step(0.01).name('Закручивание');
+            } 
+            else if (l.type === 'sphere') {
+                fGen.add(l, 'spacing', 50, 800).name('Радиус Сферы');
+                fGen.add(l, 'rings', 1, 100).step(1).name('Витки Спирали');
+                fGen.add(l, 'twist', -0.5, 0.5).step(0.001).name('Наклон');
+            }
+            else if (l.type === 'clelia') {
+                fGen.add(l, 'spacing', 10, 1000).name('Радиус Сферы (Scale)'); 
+                fGen.add(l, 'petals', 0.1, 20).step(0.1).name('Параметр m (Узор)'); 
+                fGen.add(l, 'rings', 1, 50).step(0.5).name('Длина линии (Витков)'); 
+            }
+            else if (l.type === 'custom_path') {
+                let pathLoader = {
+                    load: () => {
+                        let input = document.createElement('input');
+                        input.type = 'file';
+                        input.accept = '.svg';
+                        input.onchange = e => {
+                            let file = e.target.files[0];
+                            if (!file) return;
+                            let reader = new FileReader();
+                            reader.onload = (event) => {
+                                let parser = new DOMParser();
+                                let doc = parser.parseFromString(event.target.result, "image/svg+xml");
+                                let pathNode = doc.querySelector('path');
+                                if (pathNode) {
+                                    l.customPathData = pathNode.getAttribute('d');
+                                    l.pathElement = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                                    l.pathElement.setAttribute('d', l.customPathData);
+                                    l.pathLength = l.pathElement.getTotalLength();
+                                    
+                                    // Вычисляем центр (Bounding Box)
+                                    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+                                    let steps = 100;
+                                    for (let i = 0; i <= steps; i++) {
+                                        let pt = l.pathElement.getPointAtLength((i / steps) * l.pathLength);
+                                        if (pt.x < minX) minX = pt.x;
+                                        if (pt.x > maxX) maxX = pt.x;
+                                        if (pt.y < minY) minY = pt.y;
+                                        if (pt.y > maxY) maxY = pt.y;
+                                    }
+                                    l.pathCenterX = (minX + maxX) / 2;
+                                    l.pathCenterY = (minY + maxY) / 2;
+                                    
+                                } else {
+                                    alert("В SVG файле не найдено тега <path>!");
+                                }
+                            };
+                            reader.readAsText(file);
+                        };
+                        input.click();
+                    }
+                };
+                fGen.add(pathLoader, 'load').name('📂 ЗАГРУЗИТЬ SVG');
+                fGen.add(l, 'pathScale', 0.1, 5.0).step(0.01).name('Масштаб пути');
+                fGen.add(l, 'pathReverse').name('Обратное направление');
+            }
+            
+            fGen.add(l, 'speed', -0.1, 0.1).step(0.001).name('Скорость');
+            fGen.add(l, 'textSize', 8, 100).name('Размер текста');
+            fGen.add(l, 'density', 0.1, 3).name('Плотность букв');
+            
+            if (l.type !== 'flower' && l.type !== 'custom_path') {
+                fGen.add(l, 'depth', 0, 2).name('Эффект Глубины (3D)');
+            }
+            
+            layerFolder.add({ remove: removeCurrentLayer }, 'remove').name('❌ Удалить слой');
+        }
+
+        function addNewLayer() {
+            layers.push(new PatternLayer());
+            sceneSettings.activeLayerIndex = layers.length - 1;
+            updateLayerGUI();
+        }
+
+        function removeCurrentLayer() {
+            if (layers.length <= 1) return; 
+            layers.splice(sceneSettings.activeLayerIndex, 1);
+            sceneSettings.activeLayerIndex = 0;
+            updateLayerGUI();
+        }
+
+        function updateCanvasSize() {
+            let res = parseInt(sceneSettings.resolution);
+            let w, h;
+            if (sceneSettings.aspectRatio === '1:1') { w = res; h = res; }
+            else if (sceneSettings.aspectRatio === '9:16') { w = res; h = Math.floor(res * 16/9); }
+            else if (sceneSettings.aspectRatio === '16:9') { h = res; w = Math.floor(res * 16/9); }
+            else if (sceneSettings.aspectRatio === '4:5') { w = res; h = Math.floor(res * 5/4); }
+            canvasWidth = w; canvasHeight = h;
+        }
+
+        function draw() {
+            // console.log("Draw called"); // Раскомментируйте если совсем все плохо
+            background(20);
+            
+            // --- STATE MACHINE ДЛЯ ЗАПИСИ ---
+            if (recordingState === 'preparing') {
+                prepareTimer++;
+                
+                // ШАГ 1: Настройка холста
+                if (prepareTimer === 1) {
+                    updateCanvasSize();
+                    recWidth = canvasWidth;
+                    recHeight = canvasHeight;
+                    
+                    if (sceneSettings.exportQuality.includes('2x')) {
+                        pixelDensity(2);
+                        console.log("PD: 2");
+                    } else {
+                        pixelDensity(1);
+                        console.log("PD: 1");
+                    }
+                    
+                    resizeCanvas(recWidth, recHeight);
+                    console.log(`Resized to ${recWidth}x${recHeight}`);
+                    background(0); // Форсируем очистку
+                    return;
+                }
+                
+                // ШАГ 2: Ждем пару кадров для стабилизации контекста
+                if (prepareTimer < 10) {
+                    background(0);
+                    fill(255); textAlign(CENTER, CENTER); textSize(20);
+                    text("INITIALIZING RENDER...", width/2, height/2);
+                    return;
+                }
+                
+                // ШАГ 3: Старт CCapture
+                if (prepareTimer === 10) {
+                    try {
+                        let capOptions = { 
+                            format: sceneSettings.exportFormat, 
+                            framerate: sceneSettings.fps || 30,
+                            verbose: false, display: false
+                        };
+                        if (sceneSettings.exportFormat === 'webm-mediarecorder') {
+                           capOptions.mimeType = 'video/webm; codecs=vp9';
+                        }
+
+                        capturer = new CCapture(capOptions);
+                        recordedFrames = 0;
+                        targetFrames = sceneSettings.recordDuration * (sceneSettings.fps || 30);
+                        
+                        capturer.start();
+                        console.log("Capturer STARTED");
+                        document.getElementById('render-progress').style.display = 'block';
+                        updateRecButtonName('⏹ RENDERING...');
+                        recordingState = 'capturing';
+                    } catch (e) {
+                        console.error(e);
+                        alert("Start failed: " + e.message);
+                        stopRecording();
+                    }
+                    return;
+                }
+            }
+
+            if (recordingState === 'capturing') {
+                if (sceneSettings.transparentBg) clear();
+                else background(0);
+                
+                push();
+                // Используем сохраненные размеры
+                translate(recWidth / 2, recHeight / 2);
+                drawScene(true);
+                pop();
+                
+                try {
+                    let canvasElement = document.querySelector('canvas');
+                    capturer.capture(canvasElement);
+                } catch (e) {
+                    console.error(e); stopRecording(); return;
+                }
+                
+                recordedFrames++;
+                if (recordedFrames % 5 === 0) {
+                    let pct = Math.floor((recordedFrames / targetFrames) * 100);
+                    document.getElementById('progress-text').innerText = `RENDERING: ${pct}%`;
+                    document.getElementById('progress-bar').style.width = `${pct}%`;
+                }
+                
+                if (recordedFrames >= targetFrames) stopRecording();
+                return;
+            }
+
+            // Preview
+            if (!canvasWidth || !canvasHeight) return;
+
+            push();
+            translate(viewX, viewY);
+            scale(viewScale);
+
+            rectMode(CENTER);
+            fill(sceneSettings.transparentBg ? 50 : 0);
+            noStroke();
+            rect(0, 0, canvasWidth, canvasHeight);
+            
+            noFill();
+            stroke(255, 50);
+            strokeWeight(2 / viewScale);
+            rect(0, 0, canvasWidth, canvasHeight);
+
+            drawScene(false);
+            
+            // Hints
+            let l = layers[sceneSettings.activeLayerIndex];
+            if (l.visible && l.type === 'custom_path' && !l.pathElement) {
+                fill(255); noStroke(); textSize(20); textAlign(CENTER, CENTER);
+                text("Загрузите .SVG файл в меню 'Генерация'", 0, 0);
+            }
+
+            // Selection
+            if (l.visible) {
+                push();
+                translate(l.x, l.y);
+                stroke(0, 255, 255, 100);
+                strokeWeight(1 / viewScale);
+                line(-10, 0, 10, 0);
+                line(0, -10, 0, 10);
+                pop();
+            }
+            pop();
+            drawUI();
+        }
+
+        function drawScene(isExporting) {
+            // console.log("drawScene called. Layers:", layers.length);
+            for (let i = 0; i < layers.length; i++) {
+                let l = layers[i];
+                if (!l.visible) continue;
+
+                push();
+                translate(l.x, l.y);
+                rotate(l.rotation);
+                scale(l.scale);
+                
+                let time = frameCount * l.speed;
+                let particles = [];
+
+                if (l.type === 'flower') {
+                    for (let r = 1; r <= l.rings; r++) {
+                        let currentBaseRadius = r * l.spacing;
+                        let circumference = TWO_PI * currentBaseRadius;
+                        let charsCount = floor((circumference * l.density) / (l.textSize * 0.8));
+                        let angleStep = TWO_PI / charsCount;
+                        let ringPhase = r * l.twist;
+
+                        for (let j = 0; j < charsCount; j++) {
+                            let angle = j * angleStep;
+                            let wave = sin(angle * l.petals + time + ringPhase);
+                            let rad = currentBaseRadius + wave * l.amplitude;
+                            let x = rad * cos(angle);
+                            let y = rad * sin(angle);
+                            let charIndex = floor(j + time * 10) % l.text.length;
+                            if (charIndex < 0) charIndex += l.text.length;
+                            
+                            particles.push({x, y, z: 0, char: l.text[charIndex], rotation: angle + HALF_PI});
+                        }
+                    }
+                } 
+                else if (l.type === 'custom_path' && l.pathElement) {
+                     let totalChars = floor((l.pathLength / (Math.max(l.textSize, 2) * 0.8)) * l.density);
+                     if (totalChars > 5000) totalChars = 5000;
+                     if (totalChars < 1) totalChars = 1;
+                     
+                     for (let j = 0; j < totalChars; j++) {
+                         let charIndex = floor(j) % l.text.length;
+                         let t = map(j, 0, totalChars, 0, 1);
+                         let speedDir = l.pathReverse ? -1 : 1;
+                         t += (time * 0.1 * speedDir); 
+                         t = t - Math.floor(t);
+                         
+                         let len = t * l.pathLength;
+                         let point = l.pathElement.getPointAtLength(len);
+                         
+                         let delta = 2.0; 
+                         let lenNext = len + delta;
+                         if (lenNext > l.pathLength) lenNext = len - delta; 
+                         let pointNext = l.pathElement.getPointAtLength(lenNext);
+                         let rot = atan2(pointNext.y - point.y, pointNext.x - point.x);
+                         if (len + delta > l.pathLength) rot += PI; 
+
+                         let px = point.x * l.pathScale;
+                         let py = point.y * l.pathScale;
+                         
+                         if (l.pathCenter) {
+                             px -= l.pathCenterX * l.pathScale;
+                             py -= l.pathCenterY * l.pathScale;
+                         }
+                         
+                         particles.push({ x: px, y: py, z: 0, char: l.text[charIndex], rotation: rot });
+                     }
+                }
+                else if (l.type === 'sphere') {
+                    let radius = l.spacing;
+                    let coils = l.rings;
+                    let totalLen = coils * TWO_PI * radius; 
+                    let charsCount = floor((totalLen * l.density) / (Math.max(l.textSize, 2) * 0.8));
+                    if (charsCount > 5000) charsCount = 5000;
+                    
+                    for (let j = 0; j < charsCount; j++) {
+                        let offset = (time * 0.5) % 2;
+                        let t = map(j, 0, charsCount, -1, 1);
+                        t += offset;
+                        if (t > 1) t -= 2; if (t < -1) t += 2;
+                        
+                        let theta = t * HALF_PI * 0.95;
+                        let phi = t * coils * TWO_PI + (l.twist * 10);
+                        
+                        let x = radius * cos(theta) * cos(phi);
+                        let y = radius * sin(theta);
+                        let z = radius * cos(theta) * sin(phi);
+                        
+                        particles.push({x, y, z, char: l.text[floor(j) % l.text.length], rotation: 0});
+                    }
+                }
+                else if (l.type === 'clelia') {
+                    let radius = l.spacing;
+                    let m = l.petals;
+                    let totalAngle = l.rings * TWO_PI;
+                    let totalPoints = floor(totalAngle * 20 * l.density); 
+                    let rotY = time; 
+                    
+                    for (let j = 0; j < totalPoints; j++) {
+                        let theta = map(j, 0, totalPoints, 0, totalAngle);
+                        let thetaFlow = theta + (time * 2);
+                        let x = radius * cos(m * thetaFlow) * sin(thetaFlow);
+                        let y = radius * sin(m * thetaFlow) * sin(thetaFlow);
+                        let z = radius * cos(thetaFlow);
+                        
+                        let x_rot = x * cos(rotY) - z * sin(rotY);
+                        let z_rot = x * sin(rotY) + z * cos(rotY);
+                        
+                        particles.push({x: x_rot, y, z: z_rot, char: l.text[floor(j) % l.text.length], rotation: 0});
+                    }
+                }
+
+                if (l.type !== 'flower') {
+                    particles.sort((a, b) => a.z - b.z);
+                }
+
+                noStroke();
+                for (let p of particles) {
+                    let scaleFactor = 1.0;
+                    let alpha = 255;
+                    if (l.type !== 'flower' && l.depth > 0) {
+                        let normZ = map(p.z, -l.spacing, l.spacing, 0, 1);
+                        scaleFactor = map(normZ, 0, 1, 0.5, 1.2); 
+                        alpha = map(normZ, 0, 1, 50, 255);
+                        if (scaleFactor < 0.2) continue;
+                    }
+                    
+                    let c = color(l.color);
+                    c.setAlpha(alpha);
+                    fill(c);
+                    textSize(l.textSize * scaleFactor);
+                    
+                    if (l.useCustomFont && l.customFont) textFont(l.customFont);
+                    else {
+                        textFont(l.fontName);
+                        textStyle(l.fontStyle === 'bold' ? BOLD : (l.fontStyle === 'italic' ? ITALIC : NORMAL));
+                    }
+
+                    push();
+                    translate(p.x, p.y);
+                    if (l.type === 'flower') rotate(p.rotation);
+                    else if (l.type === 'custom_path') rotate(p.rotation);
+                    
+                    if (l.useImage && l.customImage) {
+                        imageMode(CENTER);
+                        tint(l.color); 
+                        let iconSize = l.textSize * scaleFactor * l.imageScale;
+                        let aspect = l.customImage.width / l.customImage.height;
+                        image(l.customImage, 0, 0, iconSize * aspect, iconSize);
+                    } else {
+                        text(p.char, 0, 0);
+                    }
+                    pop();
+                }
+                pop();
+            }
+        }
+
+        function drawUI() {
+            fill(255); noStroke(); textSize(14); textAlign(LEFT, TOP);
+            text(`FPS: ${Math.floor(frameRate())}`, 10, 10);
+            text(`Active Layer: ${sceneSettings.activeLayerIndex + 1} / ${layers.length}`, 10, 30);
+            text(`[Space+Drag] = Move View`, 10, height - 40);
+            text(`[Drag Object] = Move Active Layer`, 10, height - 20);
+        }
+
+        function mousePressed() {
+            lastMouseX = mouseX; lastMouseY = mouseY;
+            if (keyIsDown(32)) isDraggingView = true;
+            else isDraggingLayer = true;
+        }
+
+        function mouseDragged() {
+            let dx = mouseX - lastMouseX;
+            let dy = mouseY - lastMouseY;
+            if (isDraggingView) { viewX += dx; viewY += dy; } 
+            else if (isDraggingLayer) {
+                layers[sceneSettings.activeLayerIndex].x += dx / viewScale;
+                layers[sceneSettings.activeLayerIndex].y += dy / viewScale;
+            }
+            lastMouseX = mouseX; lastMouseY = mouseY;
+        }
+
+        function mouseReleased() { isDraggingView = false; isDraggingLayer = false; }
+        
+        function mouseWheel(event) {
+            let zoomSpeed = 0.05;
+            if (event.delta < 0) viewScale *= (1 + zoomSpeed);
+            else viewScale *= (1 - zoomSpeed);
+            viewScale = constrain(viewScale, 0.1, 10);
+            return false;
+        }
+        
+        function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+
+        function toggleRecording() {
+            if (recordingState !== 'idle') stopRecording();
+            else startRecording();
+        }
+
+        function startRecording() {
+            if (recordingState !== 'idle') return;
+            if (typeof CCapture === 'undefined') { alert("CCapture lib missing!"); return; }
+
+            console.log("Starting render sequence...");
+            recordingState = 'preparing';
+            prepareTimer = 0;
+            updateRecButtonName('⏳ PREPARING...');
+        }
+
+        function stopRecording() {
+            if (recordingState === 'idle') return;
+            
+            document.getElementById('render-progress').style.display = 'none';
+            if (capturer) {
+                capturer.stop();
+                capturer.save();
+            }
+            
+            // Сброс
+            pixelDensity(1);
+            resizeCanvas(windowWidth, windowHeight);
+            recordingState = 'idle';
+            updateRecButtonName('🔴 Начать Запись (Render)');
+        }
+
+        function updateRecButtonName(name) {
+            // Упрощенный поиск кнопки
+            let folder = gui.__folders['Сцена / Экспорт'];
+            if (folder) {
+                let c = folder.__controllers.find(c => c.property === 'toggleRecord');
+                if (c) c.name(name);
+            }
+        }
+    </script>
+</body>
+</html>

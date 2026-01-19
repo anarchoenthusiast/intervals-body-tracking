@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polar Text Experiment</title>
+    <!-- Подключаем p5.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/p5.js"></script>
+    <!-- Подключаем библиотеку для GUI (панель управления) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.9/dat.gui.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #222; }
+        canvas { display: block; }
+        /* Для визуализации прозрачности добавляем шахматный фон */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: 
+                linear-gradient(45deg, #333 25%, transparent 25%),
+                linear-gradient(-45deg, #333 25%, transparent 25%),
+                linear-gradient(45deg, transparent 75%, #333 75%),
+                linear-gradient(-45deg, transparent 75%, #333 75%);
+            background-size: 20px 20px;
+            background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+            pointer-events: none;
+            z-index: -1;
+            opacity: 0.3;
+        }
+    </style>
+</head>
+<body>
+    <script>
+        window.onerror = function(msg, url, line) {
+           alert("Error: " + msg + "\nLine: " + line);
+        };
+
+        let settings = {
+            text: "SATURN ",     // Текст для отображения
+            petals: 6,           // Количество лепестков
+            rings: 15,           // Количество кругов
+            spacing: 25,         // Расстояние между кругами
+            amplitude: 20,       // Сила искажения (глубина лепестков)
+            twist: 0.2,          // Закручивание (сдвиг фазы между кругами)
+            speed: 0.02,         // Скорость вращения
+            textSize: 12,        // Размер шрифта
+            density: 1.0,        // Плотность букв
+            transparentBg: false, // Прозрачный фон для записи
+            aspectRatio: '1:1',  // Соотношение сторон
+            resolution: 1080     // Базовое разрешение (ширина или высота)
+        };
+
+        let canvasWidth = 1080;
+        let canvasHeight = 1080;
+        let pg; 
+        
+        // Объявляем глобально
+        let recorder;
+        let chunks = [];
+        let isRecording = false;
+
+        function setup() {
+            createCanvas(windowWidth, windowHeight);
+            textAlign(CENTER, CENTER);
+            textFont('Courier New');
+            
+            // Сначала инициализируем размеры!
+            updateCanvasSize();
+            
+            // Настройка панели управления (GUI)
+            let gui = new dat.GUI();
+            gui.add(settings, 'text').name('Текст');
+            
+            let fAnim = gui.addFolder('Анимация');
+            fAnim.add(settings, 'petals', 0, 20).step(1).name('Лепестки');
+            fAnim.add(settings, 'amplitude', 0, 100).name('Амплитуда');
+            fAnim.add(settings, 'rings', 1, 30).step(1).name('Кол-во колец');
+            fAnim.add(settings, 'spacing', 10, 100).name('Отступ колец');
+            fAnim.add(settings, 'twist', -2, 2).step(0.01).name('Закручивание');
+            fAnim.add(settings, 'speed', -0.1, 0.1).step(0.001).name('Скорость');
+            fAnim.add(settings, 'density', 0.5, 2).name('Плотность букв');
+            fAnim.open();
+            
+            let fExport = gui.addFolder('Экспорт / Размер');
+            fExport.add(settings, 'aspectRatio', ['1:1', '9:16', '16:9', '4:5']).name('Формат').onChange(updateCanvasSize);
+            fExport.add(settings, 'resolution', [720, 1080, 1920]).name('Разрешение').onChange(updateCanvasSize);
+            fExport.add(settings, 'transparentBg').name('Прозрачный фон');
+            
+            let recordingObj = {
+                record: function() {
+                    startRecording();
+                }
+            };
+            fExport.add(recordingObj, 'record').name('🔴 Записать (WebM)');
+            fExport.open();
+        }
+
+        function updateCanvasSize() {
+            let res = parseInt(settings.resolution);
+            let w, h;
+            
+            // Логика: resolution - это "короткая сторона" или база.
+            // Для упрощения: resolution - это ВСЕГДА ширина (width), кроме случая 16:9 landscape, где это высота?
+            // Давай договоримся: resolution - это ширина Canvas.
+            
+            if (settings.aspectRatio === '1:1') {
+                w = res; 
+                h = res;
+            } else if (settings.aspectRatio === '9:16') {
+                w = res;
+                h = Math.floor(res * (16/9));
+            } else if (settings.aspectRatio === '16:9') {
+                // Если мы хотим 1920x1080 при выборе 1080, то res - это высота
+                // Если мы хотим 1080x607, то res - это ширина
+                // Обычно для сторис 1080x1920, значит для ютуба 1920x1080.
+                // Пусть resolution задает МЕНЬШУЮ сторону.
+                h = res;
+                w = Math.floor(res * (16/9));
+            } else if (settings.aspectRatio === '4:5') {
+                w = res;
+                h = Math.floor(res * (5/4));
+            } else {
+                w = res;
+                h = res;
+            }
+
+            canvasWidth = w;
+            canvasHeight = h;
+            
+            console.log(`Canvas size updated: ${canvasWidth}x${canvasHeight}`);
+
+            // Пересоздаем буфер
+            if (pg) pg.remove();
+            pg = createGraphics(canvasWidth, canvasHeight);
+            pg.textAlign(CENTER, CENTER);
+            pg.textFont('Courier New');
+        }
+
+        function startRecording() {
+            if (isRecording) return;
+            isRecording = true;
+            chunks = [];
+            
+            // ВАЖНО: Захватываем не основной канвас, а поток с буфера pg!
+            // Но p5.js createGraphics не создает DOM элемент по умолчанию.
+            // Поэтому нам придется рисовать pg на основном канвасе и кропать, ИЛИ...
+            // Проще всего: при записи мы будем сохранять именно то, что в буфере.
+            
+            // P5.js hack: чтобы захватить поток с p5.Graphics, нужно рисовать его на отдельном скрытом канвасе
+            // или использовать canvas.captureStream() основного канваса, НО...
+            // Основной канвас масштабируется под экран.
+            
+            // Лучший способ: временно resizeCanvas под целевой размер, записать, потом вернуть.
+            // Это обеспечит pixel-perfect качество.
+            
+            resizeCanvas(canvasWidth, canvasHeight);
+            
+            // Ждем 1 кадр для применения размера
+            setTimeout(() => {
+                const stream = document.querySelector('canvas').captureStream(30);
+                
+                let options;
+                if (settings.transparentBg) {
+                    options = { mimeType: 'video/webm; codecs=vp9' };
+                    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                        options = { mimeType: 'video/webm; codecs=vp8' };
+                    }
+                } else {
+                    options = { mimeType: 'video/webm; codecs=vp9' };
+                    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                        options = { mimeType: 'video/webm' };
+                    }
+                }
+                
+                recorder = new MediaRecorder(stream, options);
+                
+                recorder.ondataavailable = (e) => {
+                    if (e.data.size > 0) chunks.push(e.data);
+                };
+                
+                recorder.onstop = () => {
+                    saveVideo();
+                    // Возвращаем размер канваса на весь экран
+                    resizeCanvas(windowWidth, windowHeight);
+                };
+                
+                recorder.start();
+                console.log("Запись началась...");
+                
+                setTimeout(() => {
+                    recorder.stop();
+                    isRecording = false;
+                    console.log("Запись завершена.");
+                }, 5000);
+            }, 100);
+        }
+
+        function saveVideo() {
+            const blob = new Blob(chunks, { type: 'video/webm' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+            // Имя файла зависит от того, прозрачный фон или нет
+            const filename = settings.transparentBg 
+                ? 'polar_kinetic_type_transparent.webm' 
+                : 'polar_kinetic_type.webm';
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            
+            // Очистка
+            setTimeout(() => {
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(url);
+            }, 100);
+        }
+
+        function draw() {
+            background(20); // Темный фон "рабочего стола"
+
+            // Защита от NaN
+            if (!canvasWidth || !canvasHeight) return;
+            
+            // Если идет запись, рисуем ТОЛЬКО паттерн на весь канвас
+            if (isRecording) {
+                if (settings.transparentBg) clear();
+                else background(0); // Черный фон при записи (если не прозрачный)
+                
+                // Центр канваса при записи - это реальный центр (так как мы сделали resizeCanvas)
+                drawPattern(width/2, height/2);
+                return;
+            }
+
+            // === РЕЖИМ ПРЕДПРОСМОТРА ===
+            push(); // <--- Добавил push здесь, так как в старом коде он был потерян при копипасте? Нет, он был.
+            // Но лучше явно открыть блок
+             
+            
+            // Рисуем "подложку" для формата (белая рамка)
+            // Масштабируем "виртуальный холст", чтобы он влезал в экран
+            let availableW = Math.max(100, width - 100);
+            let availableH = Math.max(100, height - 100);
+            let scaleFactor = Math.min(availableW / canvasWidth, availableH / canvasHeight);
+            
+            // Центрируем
+            translate(width / 2, height / 2);
+            scale(scaleFactor);
+            
+            // Фон виртуального холста (область записи)
+            fill(settings.transparentBg ? 50 : 0); // Темнее для контраста
+            noStroke();
+            rectMode(CENTER);
+            rect(0, 0, canvasWidth, canvasHeight);
+            
+            // Шахматка для прозрачности (только внутри области записи)
+            if (settings.transparentBg) {
+                drawingContext.save();
+                drawingContext.beginPath();
+                drawingContext.rect(-canvasWidth/2, -canvasHeight/2, canvasWidth, canvasHeight);
+                drawingContext.clip();
+                // ... тут можно нарисовать паттерн, но просто оставим серый
+                drawingContext.restore();
+            }
+            
+            // Рамка (границы записи)
+            noFill();
+            stroke(255, 0, 0); // Красная рамка, чтобы было видно
+            strokeWeight(2 / scaleFactor); // Чтобы толщина линии не зависела от зума
+            rect(0, 0, canvasWidth, canvasHeight);
+            
+            // Рисуем сам паттерн
+            // Важно: drawPattern рисует относительно (0,0), который мы сдвинули в центр translate-ом
+            drawPattern(0, 0);
+            
+            pop(); // Возвращаем матрицу трансформации
+            
+            // Инфо текст (поверх всего, в углу экрана)
+            fill(255);
+            noStroke();
+            textSize(16);
+            textAlign(LEFT, TOP);
+            text(`REC Format: ${settings.aspectRatio} (${canvasWidth}x${canvasHeight})`, 20, 20);
+        }
+
+        // Вынесли логику отрисовки в отдельную функцию
+        function drawPattern(centerX, centerY) {
+            fill(255);
+            noStroke();
+            textSize(settings.textSize);
+
+            let time = frameCount * settings.speed;
+
+            // Если ничего не рисуется - нарисуем тестовый круг в центре
+            // ellipse(centerX, centerY, 10, 10);
+
+            // Цикл по кольцам (от центра к краям)
+            for (let i = 1; i <= settings.rings; i++) {
+                
+                let currentBaseRadius = i * settings.spacing;
+                let circumference = TWO_PI * currentBaseRadius;
+                let charsCount = floor((circumference * settings.density) / (settings.textSize * 0.8));
+                let angleStep = TWO_PI / charsCount;
+                let ringPhase = i * settings.twist;
+
+                for (let j = 0; j < charsCount; j++) {
+                    let angle = j * angleStep;
+                    let wave = sin(angle * settings.petals + time + ringPhase);
+                    let r = currentBaseRadius + wave * settings.amplitude;
+
+                    let x = centerX + r * cos(angle);
+                    let y = centerY + r * sin(angle);
+
+                    push();
+                    translate(x, y);
+                    rotate(angle + HALF_PI);
+                    
+                    let charIndex = floor(j + time * 10) % settings.text.length;
+                    if (charIndex < 0) charIndex += settings.text.length;
+                    
+                    text(settings.text[charIndex], 0, 0);
+                    pop();
+                }
+            }
+        }
+
+        // Чтобы канвас менялся при изменении размера окна
+        function windowResized() {
+            resizeCanvas(windowWidth, windowHeight);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Body Tracking: Cloud, Contour & Grid</title>
+    <!-- P5.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/p5.js"></script>
+    <!-- Dat.GUI -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.9/dat.gui.min.js"></script>
+    <!-- MediaPipe Selfie Segmentation -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
+    <!-- MediaPipe Camera Utils -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; font-family: sans-serif; }
+        
+        /* Layer 1: Bottom Background (e.g. Blurred BG) */
+        #bg-canvas-1 { position: absolute; top: 0; left: 0; z-index: 0; }
+        
+        /* Layer 2: Top Background Overlay (e.g. Sharp Person) */
+        #bg-canvas-2 { position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        /* Foreground P5 Canvas (Particles/Text) */
+        canvas.p5Canvas { display: block; position: absolute; top: 0; left: 0; z-index: 2; pointer-events: none; }
+        
+        #video-container { display: none; }
+        
+        #ui-container {
+            position: absolute; top: 10px; left: 10px; z-index: 2000;
+            display: flex; gap: 10px; flex-wrap: wrap;
+        }
+
+        .btn {
+            background: rgba(0, 0, 0, 0.7); color: white; border: 1px solid #00ffcc;
+            padding: 8px 15px; cursor: pointer; font-family: monospace; font-size: 14px;
+            border-radius: 4px; text-transform: uppercase;
+        }
+        .btn:hover { background: rgba(0, 255, 204, 0.2); }
+        #file-input { display: none; }
+
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: white; font-family: monospace; font-size: 24px; pointer-events: none;
+            text-align: center; z-index: 2000;
+        }
+        
+        .dg.ac { z-index: 10000 !important; }
+        #debug-console {
+            position: absolute; top: 60px; left: 10px; width: 300px; height: 150px;
+            background: rgba(0,0,0,0.5); color: #0f0; font-family: monospace;
+            font-size: 10px; pointer-events: none; overflow-y: auto; display: none; z-index: 999;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui-container">
+        <button class="btn" onclick="document.getElementById('file-input').click()">📁 Open File</button>
+        <button class="btn" onclick="toggleWebcam()">📷 Webcam</button>
+        <input type="file" id="file-input" accept="video/*,image/*">
+    </div>
+
+    <!-- Background Layers -->
+    <canvas id="bg-canvas-1"></canvas>
+    <canvas id="bg-canvas-2"></canvas>
+
+    <div id="debug-console"></div>
+    <div id="loading">Loading AI Model...</div>
+    <video id="input-video" playsinline crossorigin="anonymous" style="display:none"></video>
+
+    <script>
+        const debugConsole = document.getElementById('debug-console');
+        function debugLog(msg) { console.log(msg); debugConsole.innerHTML += `<div>> ${msg}</div>`; debugConsole.scrollTop = debugConsole.scrollHeight; }
+        function debugError(msg) { console.error(msg); debugConsole.innerHTML += `<div style="color:red">! ${msg}</div>`; debugConsole.scrollTop = debugConsole.scrollHeight; }
+
+        let segmentation;
+        let videoElement;
+        let camera;
+        let p5Video = null;
+        let p5Image = null;
+        let currentSourceType = 'webcam'; 
+        
+        // Background Canvases
+        let bgCanvas1, bgCtx1;
+        let bgCanvas2, bgCtx2;
+
+        // Buffers & Data
+        let maskGraphics; 
+        let contourPoints = []; 
+        let particles = [];
+        let hasNewMask = false;
+
+        const settings = {
+            mode: 'grid', 
+            
+            // Cloud Settings
+            particleCount: 2000,
+            particleSize: 4,
+            speed: 0.5,
+            noiseScale: 0.005,
+            
+            // Contour Settings
+            contourText: "INTERVALS 2026 R&D TEST ",
+            textSize: 14,
+            textSpeed: 1,
+            smoothness: 2, 
+            
+            // Grid Settings
+            gridSpacing: 20,
+            gridChars: "+",
+            gridJitter: 0,
+            
+            // Color Grading (Blurred Layer)
+            invert: 0,
+            contrast: 1,
+            brightness: 1,
+            sepia: 0,
+            hueRotate: 0,
+            saturate: 1,
+            
+            // Common
+            threshold: 128,
+            blurAmount: 0,
+            blurMode: 'background', // 'all', 'background', 'contour'
+            debugMask: false, 
+            glow: true,
+            color: [100, 255, 200],
+            mirror: true,
+            showVideo: true,
+            frameByFrame: true
+        };
+        
+        let textOffset = 0;
+
+        function onResults(results) {
+            maskGraphics.clear();
+            maskGraphics.drawingContext.drawImage(results.segmentationMask, 0, 0, maskGraphics.width, maskGraphics.height);
+            maskGraphics.loadPixels();
+            hasNewMask = true;
+            
+            if (settings.mode === 'contour') {
+                findContour();
+            }
+
+            const loading = document.getElementById('loading');
+            if (loading && loading.style.display !== 'none') loading.style.display = 'none';
+            
+            if (currentSourceType === 'video' && settings.frameByFrame && p5Video) {
+                 setTimeout(stepVideo, 0); 
+            }
+        }
+
+        async function setup() {
+            debugLog("Setup started");
+            
+            // Init Background Canvases
+            bgCanvas1 = document.getElementById('bg-canvas-1');
+            bgCtx1 = bgCanvas1.getContext('2d');
+            bgCanvas2 = document.getElementById('bg-canvas-2');
+            bgCtx2 = bgCanvas2.getContext('2d');
+            
+            createCanvas(windowWidth, windowHeight);
+            try { initGui(); } catch(e) {}
+            
+            // Resize BG canvases to match
+            windowResized();
+
+            videoElement = document.getElementById('input-video');
+            document.getElementById('file-input').addEventListener('change', handleFileUpload);
+            
+            maskGraphics = createGraphics(160, 120); 
+            maskGraphics.pixelDensity(1);
+            
+            initParticles();
+
+            try {
+                debugLog("Init MediaPipe...");
+                segmentation = new SelfieSegmentation({locateFile: (file) => {
+                    return `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`;
+                }});
+                
+                segmentation.setOptions({ modelSelection: 1, selfieMode: settings.mirror });
+                segmentation.onResults(onResults);
+                startWebcam();
+            } catch(e) { debugError("Setup Error: " + e.message); }
+            
+            textFont('monospace');
+        }
+
+        function initGui() {
+            let gui = new dat.GUI();
+            gui.add(settings, 'mode', ['cloud', 'contour', 'grid', 'mixed']);
+            
+            let fCloud = gui.addFolder('Cloud Particles');
+            fCloud.add(settings, 'particleCount', 100, 5000).step(100).onFinishChange(initParticles);
+            fCloud.add(settings, 'particleSize', 1, 20);
+            fCloud.add(settings, 'speed', 0, 5);
+            fCloud.add(settings, 'noiseScale', 0.001, 0.05);
+            
+            let fContour = gui.addFolder('Contour Text');
+            fContour.add(settings, 'contourText');
+            fContour.add(settings, 'textSize', 8, 48);
+            fContour.add(settings, 'textSpeed', -5, 5);
+            fContour.add(settings, 'smoothness', 1, 5).step(1);
+            
+            let fGrid = gui.addFolder('Text Grid');
+            fGrid.add(settings, 'gridSpacing', 10, 100).step(5);
+            fGrid.add(settings, 'gridChars');
+            fGrid.add(settings, 'gridJitter', 0, 10);
+            fGrid.open();
+            
+            let fColor = gui.addFolder('Color (Blurred Layer)');
+            fColor.add(settings, 'invert', 0, 1).step(0.01).name('Invert');
+            fColor.add(settings, 'contrast', 0, 3).step(0.1).name('Contrast');
+            fColor.add(settings, 'brightness', 0, 3).step(0.1).name('Brightness');
+            fColor.add(settings, 'sepia', 0, 1).step(0.01).name('Sepia');
+            fColor.add(settings, 'hueRotate', 0, 360).step(1).name('Hue Rotate');
+            fColor.add(settings, 'saturate', 0, 3).step(0.1).name('Saturate');
+            fColor.open();
+
+            let fCommon = gui.addFolder('Common');
+            fCommon.add(settings, 'threshold', 10, 250);
+            fCommon.add(settings, 'blurAmount', 0, 50).name('Blur Amount');
+            fCommon.add(settings, 'blurMode', ['all', 'background', 'contour']).name('Blur Mode');
+            fCommon.addColor(settings, 'color');
+            fCommon.add(settings, 'showVideo');
+            fCommon.add(settings, 'debugMask');
+            fCommon.add(settings, 'glow');
+            fCommon.add(settings, 'mirror').onFinishChange(val => {
+                segmentation.setOptions({ selfieMode: val });
+            });
+            fCommon.add(settings, 'frameByFrame').name('High Precision (Video)').onChange(val => {
+                if(currentSourceType === 'video' && p5Video) {
+                    if(val) p5Video.pause(); else p5Video.loop();
+                    if(val) stepVideo(); else loopVideoProcessing();
+                }
+            });
+            fCommon.open();
+        }
+
+        function findContour() {
+            contourPoints = [];
+            const w = maskGraphics.width;
+            const h = maskGraphics.height;
+            const pixels = maskGraphics.pixels;
+            const threshold = settings.threshold;
+            
+            if (!pixels || pixels.length === 0) return;
+
+            let startX = -1, startY = -1;
+            
+            searchLoop:
+            for (let y = 2; y < h - 2; y++) {
+                for (let x = 2; x < w - 2; x++) {
+                    let idx = (x + y * w) * 4;
+                    // Check alpha as well for safety
+                    if (pixels[idx] > threshold && pixels[idx+3] > 0) { 
+                        startX = x; startY = y;
+                        break searchLoop;
+                    }
+                }
+            }
+            
+            if (startX === -1) {
+                // debugLog("No contour start found");
+                return; 
+            }
+
+            let cx = startX;
+            let cy = startY;
+            let backtrack = 6; // Came from West
+            
+            // Standard Moore-Neighbor moves (Clockwise)
+            // 0:N, 1:NE, 2:E, 3:SE, 4:S, 5:SW, 6:W, 7:NW
+            const moves = [
+                [0, -1], [1, -1], [1, 0], [1, 1], 
+                [0, 1], [-1, 1], [-1, 0], [-1, -1]
+            ];
+            
+            contourPoints.push({x: cx/w, y: cy/h});
+            
+            let maxPoints = 3000;
+            let iter = 0;
+            
+            while (iter < maxPoints) {
+                iter++;
+                let foundNext = false;
+                
+                // Start checking from backtrack's clockwise neighbor
+                // Usually (backtrack + 1) % 8 or (backtrack + 2) for 4-connected?
+                // Let's iterate all 8
+                for (let i = 0; i < 8; i++) {
+                    let checkDir = (backtrack + 1 + i) % 8;
+                    let nx = cx + moves[checkDir][0];
+                    let ny = cy + moves[checkDir][1];
+                    
+                    if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                        let idx = (nx + ny * w) * 4;
+                        if (pixels[idx] > threshold && pixels[idx+3] > 0) {
+                            cx = nx;
+                            cy = ny;
+                            contourPoints.push({x: cx/w, y: cy/h});
+                            
+                            // Backtrack is the neighbor pointing back to previous pixel
+                            // Direction FROM new TO old is (checkDir + 4) % 8
+                            backtrack = (checkDir + 4) % 8;
+                            foundNext = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if (!foundNext) break; 
+                
+                // Close loop check
+                if (iter > 10 && Math.abs(cx - startX) <= 1 && Math.abs(cy - startY) <= 1) {
+                    break;
+                }
+            }
+        }
+        
+        function resetSources() {
+            if (p5Video) { p5Video.stop(); p5Video.remove(); p5Video = null; }
+            if (p5Image) { p5Image = null; }
+            if (camera) { camera.stop(); }
+            videoElement.pause();
+            videoElement.src = "";
+            hasNewMask = false;
+            contourPoints = [];
+        }
+
+        function startWebcam() {
+            resetSources();
+            currentSourceType = 'webcam';
+            camera = new Camera(videoElement, {
+                onFrame: async () => { try { await segmentation.send({image: videoElement}); } catch(e) {} },
+                width: 640, height: 480
+            });
+            camera.start();
+            settings.mirror = true; 
+            segmentation.setOptions({ selfieMode: true });
+        }
+
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            resetSources();
+            const url = URL.createObjectURL(file);
+
+            if (file.type.startsWith('image/')) {
+                currentSourceType = 'image';
+                loadImage(url, (img) => {
+                    p5Image = img;
+                    settings.mirror = false;
+                    segmentation.setOptions({ selfieMode: false });
+                    setTimeout(() => processImage(img), 100);
+                    setTimeout(() => processImage(img), 500);
+                    setTimeout(() => processImage(img), 1000);
+                });
+            } else if (file.type.startsWith('video/')) {
+                currentSourceType = 'video';
+                p5Video = createVideo(url, () => {
+                    p5Video.volume(0); p5Video.hide();
+                    settings.mirror = false;
+                    segmentation.setOptions({ selfieMode: false });
+                    if (settings.frameByFrame) { p5Video.pause(); stepVideo(); } 
+                    else { p5Video.loop(); loopVideoProcessing(); }
+                });
+            }
+        }
+        
+        async function processImage(img) {
+            if(currentSourceType !== 'image') return;
+            try { await segmentation.send({image: img.canvas || img.elt}); } catch(e) {}
+        }
+
+        function toggleWebcam() { startWebcam(); }
+
+        async function loopVideoProcessing() {
+            if (currentSourceType !== 'video' || !p5Video || settings.frameByFrame) return;
+            let vid = p5Video.elt;
+            if (!vid.paused && !vid.ended && vid.readyState >= 2) {
+                try { await segmentation.send({image: vid}); } catch(e) {}
+            }
+            requestAnimationFrame(loopVideoProcessing);
+        }
+
+        async function stepVideo() {
+            if (currentSourceType !== 'video' || !p5Video || !settings.frameByFrame) return;
+            let vid = p5Video.elt;
+            if (vid.readyState >= 2) {
+                try {
+                    await segmentation.send({image: vid});
+                    let step = 1/30; 
+                    if (vid.currentTime + step >= vid.duration) vid.currentTime = 0; 
+                    else vid.currentTime += step;
+                } catch(e) { }
+            } else { setTimeout(stepVideo, 100); }
+        }
+
+        function initParticles() {
+            particles = [];
+            for(let i=0; i<settings.particleCount; i++) {
+                particles.push(new Particle());
+            }
+        }
+
+        function drawSource(ctx, element, dx, dy, dw, dh) {
+            ctx.save();
+            ctx.setTransform(1, 0, 0, 1, 0, 0); 
+            ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+            
+            if (settings.mirror) {
+                ctx.translate(ctx.canvas.width, 0); 
+                ctx.scale(-1, 1);
+            }
+            ctx.drawImage(element, dx, dy, dw, dh);
+            ctx.restore();
+        }
+
+        function applyMask(ctx, operation, dx, dy, dw, dh) {
+            ctx.save();
+            ctx.setTransform(1, 0, 0, 1, 0, 0); 
+            if (settings.mirror) {
+                ctx.translate(ctx.canvas.width, 0); 
+                ctx.scale(-1, 1);
+            }
+            ctx.globalCompositeOperation = operation;
+            ctx.drawImage(maskGraphics.elt, dx, dy, dw, dh);
+            ctx.restore();
+        }
+
+        function clearCtx(ctx) {
+             ctx.save();
+             ctx.setTransform(1, 0, 0, 1, 0, 0);
+             ctx.clearRect(0,0, ctx.canvas.width, ctx.canvas.height);
+             ctx.restore();
+        }
+        
+        function getFilterString() {
+            return `blur(${settings.blurAmount}px) ` +
+                   `invert(${settings.invert}) ` +
+                   `contrast(${settings.contrast}) ` +
+                   `brightness(${settings.brightness}) ` +
+                   `sepia(${settings.sepia}) ` +
+                   `hue-rotate(${settings.hueRotate}deg) ` +
+                   `saturate(${settings.saturate})`;
+        }
+
+        function draw() {
+            // Determine Source
+            let src = null; let srcW = 0, srcH = 0;
+            let drawableElement = null; 
+
+            if (currentSourceType === 'webcam' && videoElement.readyState >= 2) { 
+                src = videoElement; srcW = 640; srcH = 480; 
+                drawableElement = videoElement;
+            }
+            else if (currentSourceType === 'video' && p5Video && p5Video.elt.readyState >= 2) { 
+                src = p5Video; srcW = p5Video.width; srcH = p5Video.height; 
+                drawableElement = p5Video.elt; 
+            }
+            else if (currentSourceType === 'image' && p5Image) { 
+                src = p5Image; srcW = p5Image.width; srcH = p5Image.height; 
+                drawableElement = p5Image.canvas || p5Image.elt; 
+            }
+
+            let drawX = 0, drawY = 0, drawW = width, drawH = height;
+
+            if (src && srcW > 0) {
+                let srcRatio = srcW / srcH;
+                let screenRatio = width / height;
+                if (screenRatio > srcRatio) { drawH = height; drawW = height * srcRatio; drawX = (width - drawW) / 2; } 
+                else { drawW = width; drawH = width / srcRatio; drawY = (height - drawH) / 2; }
+
+                if (settings.showVideo && drawableElement) {
+                    let filterStr = getFilterString();
+                    
+                    if (settings.blurMode === 'all') {
+                        // Mode ALL: C1 Blurred+Colored, C2 Hidden
+                        drawSource(bgCtx1, drawableElement, drawX, drawY, drawW, drawH);
+                        bgCanvas1.style.filter = filterStr;
+                        clearCtx(bgCtx2);
+                        bgCanvas2.style.filter = 'none';
+                        
+                    } else if (settings.blurMode === 'background') {
+                        // Mode BACKGROUND: C1 Blurred+Colored, C2 Sharp+Normal
+                        drawSource(bgCtx1, drawableElement, drawX, drawY, drawW, drawH);
+                        bgCanvas1.style.filter = filterStr;
+                        
+                        drawSource(bgCtx2, drawableElement, drawX, drawY, drawW, drawH);
+                        bgCanvas2.style.filter = 'none';
+                        applyMask(bgCtx2, 'destination-in', drawX, drawY, drawW, drawH);
+                        
+                    } else if (settings.blurMode === 'contour') {
+                        // Mode CONTOUR (Person): C1 Sharp+Normal, C2 Blurred+Colored
+                        
+                        // Layer 1: Sharp Background (Remove Person)
+                        drawSource(bgCtx1, drawableElement, drawX, drawY, drawW, drawH);
+                        bgCanvas1.style.filter = 'none';
+                        applyMask(bgCtx1, 'destination-out', drawX, drawY, drawW, drawH);
+                        
+                        // Layer 2: Blurred Person (Keep Person)
+                        drawSource(bgCtx2, drawableElement, drawX, drawY, drawW, drawH);
+                        bgCanvas2.style.filter = filterStr;
+                        applyMask(bgCtx2, 'destination-in', drawX, drawY, drawW, drawH);
+                    }
+                    
+                } else {
+                    bgCanvas1.style.filter = 'none'; bgCtx1.fillStyle = '#000'; bgCtx1.fillRect(0,0,width,height);
+                    bgCanvas2.style.filter = 'none'; clearCtx(bgCtx2);
+                }
+            } else {
+                bgCanvas1.style.filter = 'none'; bgCtx1.fillStyle = '#000'; bgCtx1.fillRect(0,0,width,height);
+                bgCanvas2.style.filter = 'none'; clearCtx(bgCtx2);
+            }
+
+            // 4. Draw Foreground (Particles/Text) on P5 Canvas
+            clear(); 
+
+            if (!hasNewMask) return;
+
+            // DRAW GLOW SETTINGS
+            if (settings.glow) {
+                drawingContext.shadowBlur = 10;
+                drawingContext.shadowColor = `rgb(${settings.color[0]}, ${settings.color[1]}, ${settings.color[2]})`;
+            } else {
+                drawingContext.shadowBlur = 0;
+            }
+            
+            fill(settings.color[0], settings.color[1], settings.color[2]);
+            noStroke();
+
+            const pixels = maskGraphics.pixels;
+            const mw = maskGraphics.width;
+            const mh = maskGraphics.height;
+
+            if (pixels.length === 0) return;
+
+            // --- MODE: CLOUD ---
+            if (settings.mode === 'cloud' || settings.mode === 'mixed') {
+                for (let p of particles) {
+                    p.update();
+                    if (p.pos.x >= drawX && p.pos.x < drawX + drawW && p.pos.y >= drawY && p.pos.y < drawY + drawH) {
+                        let normX = (p.pos.x - drawX) / drawW;
+                        let normY = (p.pos.y - drawY) / drawH;
+                        let mx = ~~(normX * mw);
+                        let my = ~~(normY * mh);
+                        if (mx >= 0 && mx < mw && my >= 0 && my < mh) {
+                            let idx = (mx + my * mw) * 4;
+                            if (pixels[idx] > settings.threshold) {
+                                ellipse(p.pos.x, p.pos.y, settings.particleSize);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- MODE: CONTOUR TEXT ---
+            if ((settings.mode === 'contour' || settings.mode === 'mixed') && contourPoints.length > 10) {
+                drawContourText(drawX, drawY, drawW, drawH);
+            }
+            
+            // --- MODE: GRID ---
+            if (settings.mode === 'grid' || settings.mode === 'mixed') {
+                drawGridText(drawX, drawY, drawW, drawH, pixels, mw, mh);
+            }
+        }
+        
+        function drawGridText(dx, dy, dw, dh, pixels, mw, mh) {
+            textSize(12);
+            textAlign(CENTER, CENTER);
+            
+            let charList = settings.gridChars.split('');
+            if (charList.length === 0) charList = ["+"];
+            
+            let sp = settings.gridSpacing;
+            let startGridX = Math.ceil(dx / sp) * sp;
+            let startGridY = Math.ceil(dy / sp) * sp;
+            
+            for (let y = startGridY; y < dy + dh; y += sp) {
+                for (let x = startGridX; x < dx + dw; x += sp) {
+                    let normX = (x - dx) / dw;
+                    let normY = (y - dy) / dh;
+                    
+                    let mx = ~~(normX * mw);
+                    let my = ~~(normY * mh);
+                    
+                    if (mx >= 0 && mx < mw && my >= 0 && my < mh) {
+                        let idx = (mx + my * mw) * 4;
+                        if (pixels[idx] > settings.threshold) {
+                            let charIndex = (Math.floor(x) + Math.floor(y)) % charList.length;
+                            let char = charList[charIndex];
+                            
+                            let jx = (Math.random() - 0.5) * settings.gridJitter;
+                            let jy = (Math.random() - 0.5) * settings.gridJitter;
+                            
+                            text(char, x + jx, y + jy);
+                        }
+                    }
+                }
+            }
+        }
+        
+        function drawContourText(dx, dy, dw, dh) {
+            textSize(settings.textSize);
+            textAlign(CENTER, CENTER);
+            
+            let txt = settings.contourText;
+            textOffset -= settings.textSpeed;
+            
+            let totalPoints = contourPoints.length;
+            let pointsPerChar = Math.max(1, (settings.textSize * 0.8) / (dw / 160));
+            
+            let totalChars = Math.floor(totalPoints / pointsPerChar);
+            let renderText = txt.repeat(Math.ceil(totalChars / txt.length) + 1);
+            
+            for (let i = 0; i < totalChars; i++) {
+                let charIndex = i % renderText.length;
+                let char = renderText[charIndex];
+                
+                let rawIdx = (i * pointsPerChar + textOffset);
+                let idx = Math.floor(rawIdx) % totalPoints;
+                if (idx < 0) idx += totalPoints;
+                
+                let nextIdx = (idx + Math.max(2, Math.floor(pointsPerChar * 0.5))) % totalPoints;
+                
+                let p1 = contourPoints[idx];
+                let p2 = contourPoints[nextIdx];
+                
+                if (!p1 || !p2) continue;
+
+                let sx = dx + p1.x * dw;
+                let sy = dy + p1.y * dh;
+                
+                let sx2 = dx + p2.x * dw;
+                let sy2 = dy + p2.y * dh;
+                
+                let angle = atan2(sy2 - sy, sx2 - sx);
+                
+                push();
+                translate(sx, sy);
+                rotate(angle);
+                text(char, 0, 0);
+                pop();
+            }
+        }
+
+        class Particle {
+            constructor() { this.reset(); this.pos = createVector(random(width), random(height)); }
+            reset() { this.pos = createVector(random(width), random(height)); this.vel = createVector(0, 0); }
+            update() {
+                let n = noise(this.pos.x * settings.noiseScale, this.pos.y * settings.noiseScale, millis() * 0.0005);
+                let angle = n * TWO_PI * 4; 
+                this.vel.x = cos(angle) * settings.speed;
+                this.vel.y = sin(angle) * settings.speed;
+                this.pos.add(this.vel);
+                if (this.pos.x < 0) this.pos.x = width; if (this.pos.x > width) this.pos.x = 0;
+                if (this.pos.y < 0) this.pos.y = height; if (this.pos.y > height) this.pos.y = 0;
+            }
+        }
+
+        function windowResized() { 
+            resizeCanvas(windowWidth, windowHeight); 
+            if(bgCanvas1) { bgCanvas1.width = windowWidth; bgCanvas1.height = windowHeight; }
+            if(bgCanvas2) { bgCanvas2.width = windowWidth; bgCanvas2.height = windowHeight; }
+        }
+    </script>
+</body>
+</html>
