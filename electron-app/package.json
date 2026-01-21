@@ -1,15 +1,41 @@
 {
-  "name": "polar-kinetic-app",
+  "name": "light-audio-grid",
   "version": "1.0.0",
-  "description": "Polar Kinetic Typography Tool",
+  "description": "Generative Light-to-Audio Grid Tool",
   "main": "main.js",
-  "scripts": {
-    "start": "electron ."
-  },
-  "keywords": [],
-  "author": "",
+  "author": "Intervals R&D",
   "license": "ISC",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "pack": "electron-builder --dir"
+  },
+  "build": {
+    "appId": "com.intervals.light-audio-grid",
+    "productName": "Light Audio Grid",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "**/*",
+      "logo.png"
+    ],
+    "mac": {
+      "category": "public.app-category.graphics-design",
+      "target": ["dmg", "zip"],
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  },
   "devDependencies": {
-    "electron": "^28.2.0"
+    "electron": "^28.2.0",
+    "electron-builder": "^24.13.3"
   }
 }
